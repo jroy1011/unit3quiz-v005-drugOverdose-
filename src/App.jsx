@@ -63,6 +63,35 @@ const REQUIRED_COLUMNS = {
   value: 'drug_overdose_deaths',
 }
 
+const VOTE_DOC_ID_KEY = 'anonVoteId'
+const VOTE_COLLECTION = 'votes'
+const VOTE_STATS_COLLECTION = 'voteStats'
+const VOTE_STATS_DOC = 'overdose-us'
+
+function getOrCreateAnonId() {
+  if (typeof window === 'undefined') return 'server'
+  const existing = window.localStorage.getItem(VOTE_DOC_ID_KEY)
+  if (existing) return existing
+  const next =
+    (typeof window.crypto?.randomUUID === 'function' && window.crypto.randomUUID()) ||
+    `anon_${Math.random().toString(16).slice(2)}_${Date.now()}`
+  window.localStorage.setItem(VOTE_DOC_ID_KEY, next)
+  return next
+}
+
+function getFirestoreOrNull() {
+  if (typeof window === 'undefined') return null
+  const firebase = window.firebase
+  if (!firebase) return null
+  const config = window.__FIREBASE_CONFIG__
+  if (!config || !config.projectId) return null
+
+  if (!firebase.apps?.length) {
+    firebase.initializeApp(config)
+  }
+  return firebase.firestore()
+}
+
 function App() {
   const chartElRef = useRef(null)
   const [status, setStatus] = useState('Loading…')
@@ -72,6 +101,8 @@ function App() {
     if (typeof window === 'undefined') return ''
     return window.localStorage.getItem('userChoice') ?? ''
   })
+  const [voteSaveStatus, setVoteSaveStatus] = useState('')
+  const [voteCounts, setVoteCounts] = useState({ yes: 0, no: 0, total: 0 })
 
   const libsReady = useMemo(() => {
     const hasPapa = typeof window !== 'undefined' && window.Papa
@@ -280,6 +311,109 @@ function App() {
     window.localStorage.setItem('userChoice', userChoice)
   }, [userChoice])
 
+  useEffect(() => {
+    const db = getFirestoreOrNull()
+    if (!db) return
+
+    const unsub = db
+      .collection(VOTE_STATS_COLLECTION)
+      .doc(VOTE_STATS_DOC)
+      .onSnapshot(
+        (snap) => {
+          const data = snap?.data?.() ?? {}
+          setVoteCounts({
+            yes: Number(data.yes ?? 0),
+            no: Number(data.no ?? 0),
+            total: Number(data.total ?? 0),
+          })
+        },
+        () => {
+          // ignore subscription errors; the UI can still function without counts
+        },
+      )
+
+    return () => unsub?.()
+  }, [])
+
+  const persistVoteToFirestore = async (choice) => {
+    const db = getFirestoreOrNull()
+    if (!db) {
+      setVoteSaveStatus('Firestore not configured (add config in public/firebase-config.js).')
+      return
+    }
+
+    try {
+      setVoteSaveStatus('Saving…')
+      const anonId = getOrCreateAnonId()
+      const firebase = window.firebase
+      const serverTimestamp = firebase.firestore.FieldValue.serverTimestamp()
+      const increment = firebase.firestore.FieldValue.increment
+
+      const voteRef = db.collection(VOTE_COLLECTION).doc(anonId)
+      const statsRef = db.collection(VOTE_STATS_COLLECTION).doc(VOTE_STATS_DOC)
+
+      await db.runTransaction(async (tx) => {
+        const [voteSnap, statsSnap] = await Promise.all([tx.get(voteRef), tx.get(statsRef)])
+
+        const prevChoice = String(voteSnap?.data?.()?.choice ?? '').trim()
+        const hasPrev = prevChoice === 'yes' || prevChoice === 'no'
+
+        // Always upsert the user's vote doc
+        tx.set(
+          voteRef,
+          {
+            choice,
+            updatedAt: serverTimestamp,
+            ...(voteSnap.exists ? {} : { createdAt: serverTimestamp }),
+            page: 'overdose-us',
+          },
+          { merge: true },
+        )
+
+        // Initialize stats doc if it doesn't exist
+        if (!statsSnap.exists) {
+          tx.set(
+            statsRef,
+            { yes: 0, no: 0, total: 0, createdAt: serverTimestamp, updatedAt: serverTimestamp },
+            { merge: true },
+          )
+        }
+
+        // Apply count deltas (avoid double-counting if user changes their mind)
+        if (!hasPrev) {
+          // first vote from this anonId
+          tx.set(
+            statsRef,
+            {
+              total: increment(1),
+              [choice]: increment(1),
+              updatedAt: serverTimestamp,
+            },
+            { merge: true },
+          )
+        } else if (prevChoice !== choice) {
+          // change vote: decrement old, increment new (total unchanged)
+          tx.set(
+            statsRef,
+            {
+              [prevChoice]: increment(-1),
+              [choice]: increment(1),
+              updatedAt: serverTimestamp,
+            },
+            { merge: true },
+          )
+        } else {
+          // same choice: just touch updatedAt so you can see activity
+          tx.set(statsRef, { updatedAt: serverTimestamp }, { merge: true })
+        }
+      })
+
+      setVoteSaveStatus('Saved to Firestore.')
+    } catch (e) {
+      setVoteSaveStatus(`Save failed: ${e?.message ?? 'unknown error'}`)
+    }
+  }
+
   return (
     <div className="app">
       <header className="headerBar">
@@ -295,22 +429,36 @@ function App() {
           type="button"
           className={`voteBtn voteYes ${userChoice === 'yes' ? 'selected' : ''}`}
           aria-pressed={userChoice === 'yes'}
-          onClick={() => setUserChoice('yes')}
+          onClick={() => {
+            setUserChoice('yes')
+            persistVoteToFirestore('yes')
+          }}
         >
-          Yes, let's do it!
+          Yes, let's do it! <span className="voteCount">({voteCounts.yes})</span>
         </button>
         <button
           type="button"
           className={`voteBtn voteNo ${userChoice === 'no' ? 'selected' : ''}`}
           aria-pressed={userChoice === 'no'}
-          onClick={() => setUserChoice('no')}
+          onClick={() => {
+            setUserChoice('no')
+            persistVoteToFirestore('no')
+          }}
         >
-          No way
+          No way <span className="voteCount">({voteCounts.no})</span>
         </button>
+        <div className="voteTotal" aria-label="Total votes">
+          Total: <b>{voteCounts.total}</b>
+        </div>
       </div>
       {!!userChoice && (
         <div className="voteThanks" role="status" aria-live="polite">
           You chose: <b>{userChoice === 'yes' ? "Yes, let's do it!" : 'No way'}</b>
+        </div>
+      )}
+      {!!voteSaveStatus && (
+        <div className="voteSaveStatus" role="status" aria-live="polite">
+          {voteSaveStatus}
         </div>
       )}
 
