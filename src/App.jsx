@@ -1,6 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
+// Plotly-like palette (stable colors for a stable "key")
+const TRACE_COLORS = [
+  '#1f77b4',
+  '#ff7f0e',
+  '#2ca02c',
+  '#d62728',
+  '#9467bd',
+  '#8c564b',
+  '#e377c2',
+  '#7f7f7f',
+  '#bcbd22',
+  '#17becf',
+]
+
 function normalizeFieldName(name) {
   return String(name ?? '').trim()
 }
@@ -40,28 +54,13 @@ function parseDateFlexible(value) {
   return null
 }
 
-function guessColumns(fields) {
-  const lower = fields.map((f) => f.toLowerCase())
-
-  const findBy = (reList) => {
-    for (const re of reList) {
-      const idx = lower.findIndex((x) => re.test(x))
-      if (idx !== -1) return fields[idx]
-    }
-    return ''
-  }
-
-  const drug = findBy([/\bdrug\b/, /\bsubstance\b/, /\bopioid\b/, /\bcategory\b/])
-  const date = findBy([/\bdate\b/, /\bweek\b/, /\bmonth\b/, /\bperiod\b/, /\bending\b/])
-  const value = findBy([/\bdeaths?\b/, /\bdeath\b/, /\bcount\b/, /\bnumber\b/, /\bvalue\b/])
-
-  return { drug, date, value }
-}
-
-function uniqueSorted(values) {
-  return Array.from(new Set(values.filter((v) => isNonEmptyString(v)).map((v) => v.trim()))).sort(
-    (a, b) => a.localeCompare(b),
-  )
+const AUTOLOAD_PATH = '/data/overdose.csv'
+const DEFAULT_JURISDICTION = 'United States'
+const REQUIRED_COLUMNS = {
+  jurisdiction: 'jurisdiction_occurrence',
+  drug: 'drug_involved',
+  date: 'month_ending_date',
+  value: 'drug_overdose_deaths',
 }
 
 function App() {
@@ -69,14 +68,6 @@ function App() {
   const [status, setStatus] = useState('Loading…')
   const [error, setError] = useState('')
   const [rows, setRows] = useState([])
-  const [fields, setFields] = useState([])
-
-  const [drugColumn, setDrugColumn] = useState('')
-  const [dateColumn, setDateColumn] = useState('')
-  const [valueColumn, setValueColumn] = useState('')
-
-  const [drugFilterText, setDrugFilterText] = useState('')
-  const [selectedDrugs, setSelectedDrugs] = useState([])
 
   const libsReady = useMemo(() => {
     const hasPapa = typeof window !== 'undefined' && window.Papa
@@ -94,11 +85,38 @@ function App() {
       return
     }
 
-    const parsed = window.Papa.parse(text, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: (h) => normalizeFieldName(h),
-    })
+    const raw = typeof text === 'string' ? text : String(text ?? '')
+    const trimmed = raw.trim()
+
+    if (trimmed.length < 10) {
+      setError(
+        'The CSV appears to be empty (0 characters read).',
+      )
+      setStatus('Failed to parse CSV.')
+      return
+    }
+
+    const parseWith = (delimiter) =>
+      window.Papa.parse(raw, {
+        header: true,
+        skipEmptyLines: true,
+        transformHeader: (h) => normalizeFieldName(h),
+        ...(delimiter ? { delimiter } : {}),
+      })
+
+    // Attempt 1: PapaParse auto-detect
+    let parsed = parseWith('')
+
+    const hasDelimiterError = (p) =>
+      Array.isArray(p?.errors) &&
+      p.errors.some((e) => String(e?.message ?? '').toLowerCase().includes('delimiting character'))
+    const tooFewFields =
+      !Array.isArray(parsed?.meta?.fields) || parsed.meta.fields.filter(Boolean).length <= 1
+
+    // Attempt 2: force comma delimiter (your dataset is comma-separated)
+    if (hasDelimiterError(parsed) || tooFewFields) {
+      parsed = parseWith(',')
+    }
 
     if (parsed.errors?.length) {
       setError(parsed.errors[0]?.message ?? 'CSV parse error')
@@ -115,33 +133,39 @@ function App() {
       return
     }
 
+    const missing = Object.values(REQUIRED_COLUMNS).filter((c) => !nextFields.includes(c))
+    if (missing.length) {
+      setError(`CSV is missing required columns: ${missing.join(', ')}`)
+      setStatus('No data loaded.')
+      return
+    }
+
     setRows(nextRows)
-    setFields(nextFields)
-
-    const guessed = guessColumns(nextFields)
-    setDrugColumn((prev) => prev || guessed.drug || nextFields[0] || '')
-    setDateColumn((prev) => prev || guessed.date || nextFields[0] || '')
-    setValueColumn((prev) => prev || guessed.value || nextFields[0] || '')
-
     setStatus(`Loaded ${nextRows.length.toLocaleString()} rows.`)
   }
 
-  // Auto-load if user copies the file into public/data/overdose.csv
+  // Auto-load from public/data/overdose.csv
   useEffect(() => {
     let cancelled = false
 
     const tryAutoLoad = async () => {
-      setStatus('Looking for public/data/overdose.csv…')
+      setStatus(`Loading ${AUTOLOAD_PATH}…`)
       try {
-        const resp = await fetch('/data/overdose.csv', { cache: 'no-store' })
+        const resp = await fetch(AUTOLOAD_PATH, { cache: 'no-store' })
         if (!resp.ok) {
-          if (!cancelled) setStatus('No auto-loaded CSV found. Use "Upload CSV" to load your file.')
+          if (!cancelled) {
+            setError(`Could not load ${AUTOLOAD_PATH}. Make sure it exists in public/data/.`)
+            setStatus('No data loaded.')
+          }
           return
         }
         const text = await resp.text()
-        if (!cancelled) await loadCsvText(text, 'public/data/overdose.csv')
+        if (!cancelled) await loadCsvText(text, AUTOLOAD_PATH)
       } catch {
-        if (!cancelled) setStatus('No auto-loaded CSV found. Use "Upload CSV" to load your file.')
+        if (!cancelled) {
+          setError(`Could not load ${AUTOLOAD_PATH}.`)
+          setStatus('No data loaded.')
+        }
       }
     }
 
@@ -152,44 +176,27 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const drugOptions = useMemo(() => {
-    if (!rows.length || !drugColumn) return []
-    return uniqueSorted(rows.map((r) => r?.[drugColumn]))
-  }, [rows, drugColumn])
-
-  const filteredDrugOptions = useMemo(() => {
-    if (!drugFilterText.trim()) return drugOptions
-    const q = drugFilterText.trim().toLowerCase()
-    return drugOptions.filter((d) => d.toLowerCase().includes(q))
-  }, [drugOptions, drugFilterText])
-
-  // Ensure selected drugs remain valid after column changes / file loads.
-  useEffect(() => {
-    setSelectedDrugs((prev) => prev.filter((d) => drugOptions.includes(d)))
-  }, [drugOptions])
-
   const tracesAndLayout = useMemo(() => {
-    if (!rows.length || !drugColumn || !dateColumn || !valueColumn) {
+    if (!rows.length) {
       return { traces: [], layout: null, meta: { usedRows: 0, droppedRows: 0 } }
     }
 
-    const allowed = selectedDrugs.length ? new Set(selectedDrugs) : null
     const byDrug = new Map() // drug -> Map(dateISO -> valueSum)
     let usedRows = 0
     let droppedRows = 0
 
     for (const r of rows) {
-      const drug = String(r?.[drugColumn] ?? '').trim()
+      const j = String(r?.[REQUIRED_COLUMNS.jurisdiction] ?? '').trim()
+      if (j !== DEFAULT_JURISDICTION) continue
+
+      const drug = String(r?.[REQUIRED_COLUMNS.drug] ?? '').trim()
       if (!drug) {
         droppedRows += 1
         continue
       }
-      if (allowed && !allowed.has(drug)) {
-        continue
-      }
 
-      const dateObj = parseDateFlexible(r?.[dateColumn])
-      const value = tryParseNumber(r?.[valueColumn])
+      const dateObj = parseDateFlexible(r?.[REQUIRED_COLUMNS.date])
+      const value = tryParseNumber(r?.[REQUIRED_COLUMNS.value])
       if (!dateObj || value === null) {
         droppedRows += 1
         continue
@@ -204,32 +211,46 @@ function App() {
 
     const traces = Array.from(byDrug.entries())
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([drug, byDate]) => {
+      .map(([drug, byDate], idx) => {
         const pairs = Array.from(byDate.entries()).sort(([d1], [d2]) => d1.localeCompare(d2))
+        const color = TRACE_COLORS[idx % TRACE_COLORS.length]
         return {
           name: drug,
           type: 'scatter',
           mode: 'lines+markers',
           x: pairs.map(([d]) => d),
           y: pairs.map(([, v]) => v),
+          line: { color, width: 2 },
+          marker: { color, size: 5 },
           hovertemplate: `<b>${drug}</b><br>%{x}: %{y}<extra></extra>`,
         }
       })
 
     const layout = {
-      title: 'Provisional Drug Overdose Death Counts (segment by drug)',
+      title: '',
       paper_bgcolor: 'rgba(0,0,0,0)',
       plot_bgcolor: 'rgba(0,0,0,0)',
       font: { color: 'rgba(255,255,255,0.9)' },
-      margin: { l: 50, r: 20, t: 60, b: 50 },
-      xaxis: { title: dateColumn, automargin: true },
-      yaxis: { title: valueColumn, automargin: true },
-      legend: { orientation: 'h', x: 0, y: 1.12 },
+      margin: { l: 55, r: 170, t: 16, b: 55 },
+      xaxis: { title: 'Month ending date', automargin: true },
+      yaxis: { title: 'Drug overdose deaths (12-month ending)', automargin: true },
+      legend: {
+        title: { text: 'Drug (click to hide/show)' },
+        orientation: 'v',
+        x: 1.02,
+        xanchor: 'left',
+        y: 1,
+        yanchor: 'top',
+        bgcolor: 'rgba(0,0,0,0.25)',
+        bordercolor: 'rgba(255,255,255,0.16)',
+        borderwidth: 1,
+        itemsizing: 'constant',
+      },
       hovermode: 'x unified',
     }
 
     return { traces, layout, meta: { usedRows, droppedRows } }
-  }, [rows, drugColumn, dateColumn, valueColumn, selectedDrugs])
+  }, [rows])
 
   // Render chart
   useEffect(() => {
@@ -249,176 +270,29 @@ function App() {
     })
   }, [tracesAndLayout])
 
-  const onUpload = async (file) => {
-    if (!file) return
-    setStatus(`Reading ${file.name}…`)
-    setError('')
-
-    try {
-      const text = await file.text()
-      await loadCsvText(text, file.name)
-      setSelectedDrugs([])
-    } catch (e) {
-      setError(e?.message ?? 'Failed to read file.')
-      setStatus('No data loaded.')
-    }
-  }
-
   return (
     <div className="app">
-      <div className="header">
-        <div>
-          <h1 className="title">US Drug Overdose Dashboard</h1>
-          <p className="subtitle">
-            Load the CSV and segment the time series by <b>drug</b>.
-          </p>
-        </div>
-        <div className="hint">
-          <div>
-            Auto-load path: <code>public/data/overdose.csv</code>
-          </div>
-      <div>
-            Or use upload below (recommended).
-          </div>
-        </div>
-      </div>
+      <header className="headerBar">
+        <div className="headerTitle">Overdose in US</div>
+      </header>
+      <div ref={chartElRef} className="chart" />
+      <footer className="bottomStatement">
+        Lets fix this. Opiods, Fentanyl, and other pain killers should not be given to people under
+        20
+      </footer>
 
-      {!libsReady && (
-        <div className="panel" style={{ marginBottom: 12 }}>
-          <b>Waiting on charting libraries…</b>
-          <div className="status">
-            This page loads PapaParse + Plotly from CDNs; make sure you’re online.
+      {(!libsReady || error || !rows.length) && (
+        <div className="overlay" role="status" aria-live="polite">
+          <div className="overlayTitle">{error ? 'Error' : 'Loading'}</div>
+          <div className="overlayText">
+            {!libsReady
+              ? 'Waiting for charting libraries… (make sure you’re online)'
+              : error
+                ? error
+                : status}
           </div>
         </div>
       )}
-
-      <div className="panel">
-        <div className="controls">
-          <div className="controlRow">
-            <label>
-              <b>Upload CSV</b>
-            </label>
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              onChange={(e) => onUpload(e.target.files?.[0] ?? null)}
-            />
-            <small>
-              Tip: select your file from <code>C:\Users\joyar\Downloads\</code>.
-            </small>
-          </div>
-
-          <div className="controlRow">
-            <label>
-              <b>Filter drugs</b> (optional)
-            </label>
-            <input
-              type="text"
-              placeholder="Search drugs…"
-              value={drugFilterText}
-              onChange={(e) => setDrugFilterText(e.target.value)}
-            />
-            <small>
-              Leave unselected to show <b>all drugs</b> as separate lines.
-            </small>
-          </div>
-
-          <div className="controlRow">
-            <label>
-              <b>Drug column</b>
-            </label>
-            <select value={drugColumn} onChange={(e) => setDrugColumn(e.target.value)}>
-              {fields.map((f) => (
-                <option key={f} value={f}>
-                  {f}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="controlRow">
-            <label>
-              <b>Date column</b>
-            </label>
-            <select value={dateColumn} onChange={(e) => setDateColumn(e.target.value)}>
-              {fields.map((f) => (
-                <option key={f} value={f}>
-                  {f}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="controlRow">
-            <label>
-              <b>Value column</b> (deaths/count)
-            </label>
-            <select value={valueColumn} onChange={(e) => setValueColumn(e.target.value)}>
-              {fields.map((f) => (
-                <option key={f} value={f}>
-                  {f}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="controlRow">
-            <label>
-              <b>Select drugs</b> (multi-select)
-            </label>
-            <select
-              className="drugSelect"
-              multiple
-              value={selectedDrugs}
-              onChange={(e) => {
-                const next = Array.from(e.target.selectedOptions).map((o) => o.value)
-                setSelectedDrugs(next)
-              }}
-            >
-              {filteredDrugOptions.map((d) => (
-                <option key={d} value={d}>
-                  {d}
-                </option>
-              ))}
-            </select>
-
-            <div className="actions">
-              <button className="btn" type="button" onClick={() => setSelectedDrugs([])}>
-                Clear selection (show all)
-              </button>
-              <button
-                className="btn"
-                type="button"
-                onClick={() => setSelectedDrugs(filteredDrugOptions.slice(0, 5))}
-                disabled={!filteredDrugOptions.length}
-              >
-                Select first 5
-        </button>
-            </div>
-          </div>
-        </div>
-
-        <div className="status">
-          <div>
-            <b>Status:</b> {status}
-          </div>
-          {error && (
-            <div style={{ marginTop: 6 }}>
-              <b>Error:</b> {error}
-            </div>
-          )}
-          {!!rows.length && (
-            <div style={{ marginTop: 6, opacity: 0.9 }}>
-              Using {tracesAndLayout.meta.usedRows.toLocaleString()} rows (dropped{' '}
-              {tracesAndLayout.meta.droppedRows.toLocaleString()} for missing date/value/drug).
-            </div>
-          )}
-        </div>
-
-        <div style={{ marginTop: 12 }}>
-          <div ref={chartElRef} className="chart" />
-        </div>
-      </div>
     </div>
   )
 }
