@@ -68,6 +68,10 @@ function App() {
   const [status, setStatus] = useState('Loading…')
   const [error, setError] = useState('')
   const [rows, setRows] = useState([])
+  const [userChoice, setUserChoice] = useState(() => {
+    if (typeof window === 'undefined') return ''
+    return window.localStorage.getItem('userChoice') ?? ''
+  })
 
   const libsReady = useMemo(() => {
     const hasPapa = typeof window !== 'undefined' && window.Papa
@@ -270,6 +274,12 @@ function App() {
     })
   }, [tracesAndLayout])
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!userChoice) return
+    window.localStorage.setItem('userChoice', userChoice)
+  }, [userChoice])
+
   return (
     <div className="app">
       <header className="headerBar">
@@ -280,6 +290,29 @@ function App() {
         Lets fix this. Opiods, Fentanyl, and other pain killers should not be given to people under
         20
       </footer>
+      <div className="voteBar" aria-label="Opinion buttons">
+        <button
+          type="button"
+          className={`voteBtn voteYes ${userChoice === 'yes' ? 'selected' : ''}`}
+          aria-pressed={userChoice === 'yes'}
+          onClick={() => setUserChoice('yes')}
+        >
+          Yes, let's do it!
+        </button>
+        <button
+          type="button"
+          className={`voteBtn voteNo ${userChoice === 'no' ? 'selected' : ''}`}
+          aria-pressed={userChoice === 'no'}
+          onClick={() => setUserChoice('no')}
+        >
+          No way
+        </button>
+      </div>
+      {!!userChoice && (
+        <div className="voteThanks" role="status" aria-live="polite">
+          You chose: <b>{userChoice === 'yes' ? "Yes, let's do it!" : 'No way'}</b>
+        </div>
+      )}
 
       {(!libsReady || error || !rows.length) && (
         <div className="overlay" role="status" aria-live="polite">
